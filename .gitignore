@@ -1,0 +1,6 @@
+# Foundry build artifacts
+cache/
+out/
+
+# Foundry runtime outputs
+broadcast/
