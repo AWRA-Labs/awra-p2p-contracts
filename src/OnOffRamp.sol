@@ -3,8 +3,9 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-contract OnOffRamp is Ownable {
+contract OnOffRamp is ReentrancyGuard, Ownable {
     struct Deposit {
         address user;
         address token;
@@ -30,6 +31,8 @@ contract OnOffRamp is Ownable {
     );
 
     event OffRampProcessed(uint256 indexed id, address indexed user);
+
+    constructor() Ownable(msg.sender) {}
 
     // 🔹 Deposit ERC20 tokens
     function deposit(address token, uint256 amount) external {
