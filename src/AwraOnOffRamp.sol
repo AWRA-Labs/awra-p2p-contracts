@@ -75,6 +75,10 @@ contract AwraOnOffRamp is Ownable, ReentrancyGuard {
         TxType txType
     ) external onlyOwner nonReentrant {
         if (txType == TxType.ONRAMP) {
+            require(amount > 0, "Invalid amount");
+            require(user != address(0), "Invalid user");
+            require(token != address(0), "Invalid token");
+
             // send tokens to user
             require(
                 IERC20(token).balanceOf(address(this)) >= amount,
@@ -83,11 +87,22 @@ contract AwraOnOffRamp is Ownable, ReentrancyGuard {
 
             IERC20(token).transfer(user, amount);
 
-            emit TransactionProcessed(id, user, TxType.ONRAMP);
+            transactions[txId] = Transaction({
+                user: user,
+                token: token,
+                amount: amount,
+                txType: TxType.ONRAMP,
+                processed: true
+            });
+
+            txId++;
+
+            emit TransactionProcessed(txId, user, TxType.ONRAMP);
         } else {
             // OFFRAMP confirmation
             Transaction storage txn = transactions[id];
 
+            require(txn.amount > 0, "Amount should be greater than zero");
             require(!txn.processed, "Already processed");
             require(txn.txType == TxType.OFFRAMP, "Wrong type");
 
