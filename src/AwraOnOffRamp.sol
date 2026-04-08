@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
 contract AwraOnOffRamp is Ownable, ReentrancyGuard {
+    using EnumerableSet for EnumerableSet.AddressSet;
+    using SafeERC20 for IERC20;
+
     enum TxType {
-        OFFRAMP, // user deposits crypto → gets fiat
-        ONRAMP // user gets crypto → paid fiat off-chain
+        OFFRAMP,
+        ONRAMP
     }
 
     struct Transaction {
@@ -21,6 +26,9 @@ contract AwraOnOffRamp is Ownable, ReentrancyGuard {
 
     uint256 public txId;
     mapping(uint256 => Transaction) public transactions;
+    mapping(address => uint256) public lockedBalances;
+
+    EnumerableSet.AddressSet private supportedTokens;
 
     event TransactionCreated(
         uint256 indexed id,
@@ -36,37 +44,91 @@ contract AwraOnOffRamp is Ownable, ReentrancyGuard {
         TxType txType
     );
 
+    event SupportedTokenAdded(address indexed token);
+    event SupportedTokenRemoved(address indexed token);
+    event TokenWithdrawn(
+        address indexed token,
+        address indexed to,
+        uint256 amount
+    );
+
     constructor() Ownable(msg.sender) {}
 
-    // 🔹 USER: Only used for OFF-RAMP (deposit crypto)
+    function addSupportedToken(address token) external onlyOwner {
+        require(token != address(0), "Invalid token");
+        require(supportedTokens.add(token), "Token already supported");
+
+        emit SupportedTokenAdded(token);
+    }
+
+    function removeSupportedToken(address token) external onlyOwner {
+        require(token != address(0), "Invalid token");
+        require(supportedTokens.remove(token), "Token not supported");
+
+        emit SupportedTokenRemoved(token);
+    }
+
+    function isSupportedToken(address token) public view returns (bool) {
+        return supportedTokens.contains(token);
+    }
+
+    function getSupportedTokens() external view returns (address[] memory) {
+        return supportedTokens.values();
+    }
+
+    function availableBalance(address token) public view returns (uint256) {
+        if (token == address(0)) {
+            return 0;
+        }
+
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        uint256 locked = lockedBalances[token];
+
+        if (balance <= locked) {
+            return 0;
+        }
+
+        return balance - locked;
+    }
+
+    // User deposits crypto for an off-ramp request.
     function createOffRamp(
         address token,
         uint256 amount
     ) external nonReentrant {
         require(amount > 0, "Invalid amount");
+        require(isSupportedToken(token), "Unsupported token");
 
-        IERC20(token).transferFrom(msg.sender, address(this), amount);
+        IERC20 erc20 = IERC20(token);
+        uint256 balanceBefore = erc20.balanceOf(address(this));
+        erc20.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 receivedAmount = erc20.balanceOf(address(this)) - balanceBefore;
 
-        transactions[txId] = Transaction({
+        require(receivedAmount == amount, "Fee-on-transfer unsupported");
+
+        uint256 currentId = txId;
+        lockedBalances[token] += receivedAmount;
+
+        transactions[currentId] = Transaction({
             user: msg.sender,
             token: token,
-            amount: amount,
+            amount: receivedAmount,
             txType: TxType.OFFRAMP,
             processed: false
         });
 
         emit TransactionCreated(
-            txId,
+            currentId,
             msg.sender,
             token,
-            amount,
+            receivedAmount,
             TxType.OFFRAMP
         );
 
-        txId++;
+        txId = currentId + 1;
     }
 
-    // 🔹 ADMIN: handles BOTH on-ramp & off-ramp
+    // Owner finalizes off-ramp requests and fulfills on-ramp requests.
     function processTransaction(
         uint256 id,
         address user,
@@ -75,40 +137,69 @@ contract AwraOnOffRamp is Ownable, ReentrancyGuard {
         TxType txType
     ) external onlyOwner nonReentrant {
         if (txType == TxType.ONRAMP) {
-            require(amount > 0, "Invalid amount");
-            require(user != address(0), "Invalid user");
-            require(token != address(0), "Invalid token");
-
-            // send tokens to user
-            require(
-                IERC20(token).balanceOf(address(this)) >= amount,
-                "Insufficient liquidity"
-            );
-
-            IERC20(token).transfer(user, amount);
-
-            transactions[txId] = Transaction({
-                user: user,
-                token: token,
-                amount: amount,
-                txType: TxType.ONRAMP,
-                processed: true
-            });
-
-            txId++;
-
-            emit TransactionProcessed(txId, user, TxType.ONRAMP);
-        } else {
-            // OFFRAMP confirmation
-            Transaction storage txn = transactions[id];
-
-            require(txn.amount > 0, "Amount should be greater than zero");
-            require(!txn.processed, "Already processed");
-            require(txn.txType == TxType.OFFRAMP, "Wrong type");
-
-            txn.processed = true;
-
-            emit TransactionProcessed(id, txn.user, TxType.OFFRAMP);
+            _processOnRamp(user, token, amount);
+            return;
         }
+
+        _processOffRamp(id);
+    }
+
+    function withdrawToken(
+        address token,
+        address to,
+        uint256 amount
+    ) external onlyOwner nonReentrant {
+        require(token != address(0), "Invalid token");
+        require(to != address(0), "Invalid recipient");
+        require(amount > 0, "Invalid amount");
+        require(
+            availableBalance(token) >= amount,
+            "Insufficient available balance"
+        );
+
+        IERC20(token).safeTransfer(to, amount);
+
+        emit TokenWithdrawn(token, to, amount);
+    }
+
+    function _processOnRamp(
+        address user,
+        address token,
+        uint256 amount
+    ) internal {
+        require(amount > 0, "Invalid amount");
+        require(user != address(0), "Invalid user");
+        require(isSupportedToken(token), "Unsupported token");
+        require(availableBalance(token) >= amount, "Insufficient liquidity");
+
+        uint256 currentId = txId;
+        transactions[currentId] = Transaction({
+            user: user,
+            token: token,
+            amount: amount,
+            txType: TxType.ONRAMP,
+            processed: true
+        });
+
+        emit TransactionCreated(currentId, user, token, amount, TxType.ONRAMP);
+
+        txId = currentId + 1;
+
+        IERC20(token).safeTransfer(user, amount);
+
+        emit TransactionProcessed(currentId, user, TxType.ONRAMP);
+    }
+
+    function _processOffRamp(uint256 id) internal {
+        Transaction storage txn = transactions[id];
+
+        require(txn.amount > 0, "Transaction not found");
+        require(!txn.processed, "Already processed");
+        require(txn.txType == TxType.OFFRAMP, "Wrong type");
+
+        txn.processed = true;
+        lockedBalances[txn.token] -= txn.amount;
+
+        emit TransactionProcessed(id, txn.user, TxType.OFFRAMP);
     }
 }
